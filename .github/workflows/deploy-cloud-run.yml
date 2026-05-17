@@ -1,0 +1,56 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: photo-cull-2026
+  REGION: europe-west1
+  SERVICE: photo-cull
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require GCP_SA_KEY secret
+        run: |
+          if [ -z "${{ secrets.GCP_SA_KEY }}" ]; then
+            echo "::error::Missing GitHub secret GCP_SA_KEY."
+            echo "Run: bash scripts/setup-github-deploy-sa.sh"
+            echo "Then add the key at:"
+            echo "https://github.com/chayaauto/photo-cull-python/settings/secrets/actions"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          service: ${{ env.SERVICE }}
+          region: ${{ env.REGION }}
+          source: .
+          flags: --allow-unauthenticated --memory=1Gi --timeout=300
+
+      - name: Show service URL
+        run: |
+          echo "Deployed to ${{ steps.deploy.outputs.url }}"
+          echo "Health check ${{ steps.deploy.outputs.url }}/health"
