@@ -1,12 +1,20 @@
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from grouping import ImageFingerprint, cluster_by_hash_distance, phash_from_path, recommend_id
+from config import validate_config_on_startup
+from grouping import (
+    ClipGroupingEngine,
+    GroupingEngine,
+    HashGroupingEngine,
+    default_grouping_engine,
+    recommend_id,
+)
 from models import GroupImagesRequest, GroupImagesResponse, ImageGroup
 from utils import ca_bundle_path, download_image_to_temp, unlink_quiet
 
@@ -16,10 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Image grouping", version="0.1.0")
+MAX_IMAGES_PER_REQUEST = 500
 
-# Comma-separated origins, e.g. http://localhost:3000,https://myapp.com
-# Default "*" allows any origin (no credentials).
+app = FastAPI(title="Image grouping", version="0.2.0")
+
 _cors_origins = [
     o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()
 ]
@@ -31,10 +39,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_grouping_engine: GroupingEngine | None = None
+
+
+def grouping_engine() -> GroupingEngine:
+    global _grouping_engine
+    if _grouping_engine is None:
+        _grouping_engine = default_grouping_engine()
+    return _grouping_engine
+
+
+def engine_for_request(body: GroupImagesRequest) -> GroupingEngine:
+    from config import get_config
+
+    if get_config().grouping_engine == "hash":
+        return HashGroupingEngine(threshold=body.hash_distance_threshold)
+    return grouping_engine()
+
 
 @app.on_event("startup")
-def _log_ssl_bundle() -> None:
+def _startup() -> None:
+    validate_config_on_startup()
     logger.info("SSL CA bundle: %s", ca_bundle_path())
+    engine = grouping_engine()
+    logger.info("Grouping engine ready: %s", type(engine).__name__)
+    if type(engine).__name__ == "ClipGroupingEngine":
+        from embeddings import EmbeddingGenerator
+
+        EmbeddingGenerator.instance()
 
 
 @app.get("/health")
@@ -58,16 +90,23 @@ async def group_images(body: GroupImagesRequest) -> GroupImagesResponse:
     if not body.images:
         raise HTTPException(status_code=400, detail="images must not be empty")
 
+    if len(body.images) > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {MAX_IMAGES_PER_REQUEST} images per request",
+        )
+
     image_ids = [img.id for img in body.images]
+    request_started = time.perf_counter()
     logger.info(
-        "group-images start count=%d threshold=%d ids=%s",
+        "group-images start image_count=%d ids=%s",
         len(body.images),
-        body.hash_distance_threshold,
         image_ids,
     )
 
     paths: list[Path] = []
     try:
+        download_started = time.perf_counter()
         tasks = [_download_one(img.id, str(img.url)) for img in body.images]
         try:
             downloaded = await asyncio.gather(*tasks)
@@ -80,28 +119,40 @@ async def group_images(body: GroupImagesRequest) -> GroupImagesResponse:
             raise HTTPException(status_code=413, detail=str(e)) from e
 
         paths = list(downloaded)
-        fingerprints: list[ImageFingerprint] = []
-        for img, path in zip(body.images, paths, strict=True):
-            try:
-                fp = phash_from_path(path, img.id)
-                logger.info(
-                    "Hashed id=%s %dx%d bytes=%d phash=%s",
-                    img.id,
-                    fp.width,
-                    fp.height,
-                    fp.file_size_bytes,
-                    fp.phash,
-                )
-            except ValueError as e:
-                logger.exception("Hash failed for id=%s path=%s", img.id, path)
-                raise HTTPException(status_code=422, detail=str(e)) from e
-            fingerprints.append(fp)
-
-        clusters = cluster_by_hash_distance(
-            fingerprints,
-            threshold=body.hash_distance_threshold,
+        download_sec = time.perf_counter() - download_started
+        logger.info(
+            "group-images downloads complete image_count=%d download_seconds=%.3f",
+            len(paths),
+            download_sec,
         )
-        logger.info("Clustered into %d group(s)", len(clusters))
+
+        group_started = time.perf_counter()
+        engine = engine_for_request(body)
+        try:
+            clusters = await asyncio.to_thread(engine.group, paths, image_ids)
+        except ValueError as e:
+            logger.exception("Grouping failed")
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        group_sec = time.perf_counter() - group_started
+
+        embedding_sec: float | None = None
+        clustering_sec: float | None = None
+        if isinstance(engine, ClipGroupingEngine):
+            embedding_sec = engine.last_embedding_seconds
+            clustering_sec = engine.last_clustering_seconds
+            logger.info(
+                "group-images embeddings_seconds=%.3f clustering_seconds=%.3f "
+                "groups_generated=%d",
+                embedding_sec or 0.0,
+                clustering_sec or 0.0,
+                len(clusters),
+            )
+        else:
+            logger.info(
+                "group-images grouping_seconds=%.3f groups_generated=%d",
+                group_sec,
+                len(clusters),
+            )
 
         groups: list[ImageGroup] = []
         for cluster in clusters:
@@ -111,7 +162,16 @@ async def group_images(body: GroupImagesRequest) -> GroupImagesResponse:
             groups.append(ImageGroup(image_ids=ids, recommended_id=rec))
         groups.sort(key=lambda g: (g.image_ids[0] if g.image_ids else "", g.recommended_id))
 
-        logger.info("group-images done groups=%d", len(groups))
+        total_sec = time.perf_counter() - request_started
+        logger.info(
+            "group-images done image_count=%d groups_generated=%d "
+            "embedding_seconds=%s clustering_seconds=%s total_seconds=%.3f",
+            len(body.images),
+            len(groups),
+            f"{embedding_sec:.3f}" if embedding_sec is not None else "n/a",
+            f"{clustering_sec:.3f}" if clustering_sec is not None else "n/a",
+            total_sec,
+        )
         return GroupImagesResponse(groups=groups)
     finally:
         for p in paths:

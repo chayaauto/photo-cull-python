@@ -9,7 +9,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py models.py grouping.py utils.py ./
+COPY main.py models.py grouping.py utils.py config.py embeddings.py similarity.py clustering.py ./
 
 ENV PORT=8080
 EXPOSE 8080
