@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from grouping import ImageFingerprint, cluster_by_hash_distance, phash_from_path, recommend_id
 from models import GroupImagesRequest, GroupImagesResponse, ImageGroup
@@ -15,6 +17,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Image grouping", version="0.1.0")
+
+# Comma-separated origins, e.g. http://localhost:3000,https://myapp.com
+# Default "*" allows any origin (no credentials).
+_cors_origins = [
+    o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials="*" not in _cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
