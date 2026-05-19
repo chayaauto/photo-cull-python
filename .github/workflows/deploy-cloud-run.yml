@@ -40,6 +40,10 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      # Default Cloud Build timeout is 10m; CLIP/torch images need longer.
+      - name: Extend Cloud Build timeout
+        run: gcloud config set builds/timeout 1800
+
       - name: Deploy to Cloud Run
         id: deploy
         uses: google-github-actions/deploy-cloudrun@v2
@@ -48,7 +52,7 @@ jobs:
           service: ${{ env.SERVICE }}
           region: ${{ env.REGION }}
           source: .
-          flags: --allow-unauthenticated --memory=1Gi --timeout=300
+          flags: --allow-unauthenticated --memory=2Gi --cpu=2 --timeout=300
 
       - name: Show service URL
         run: |
